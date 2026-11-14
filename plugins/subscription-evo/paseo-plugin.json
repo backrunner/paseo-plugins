@@ -1,0 +1,8 @@
+{
+  "id": "subscription-evo",
+  "name": "SubscriptionEvo",
+  "description": "Queue messages and resume work after temporary errors or quota recovery.",
+  "requirements": {
+    "paseo": "0.15.4"
+  }
+}

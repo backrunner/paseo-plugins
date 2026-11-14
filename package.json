@@ -1,0 +1,35 @@
+{
+  "name": "paseo-plugins",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test && node --test scripts/*.test.mjs",
+    "verify": "pnpm typecheck && pnpm test",
+    "verify:reference": "pnpm --filter @paseo-plugins/session-reference typecheck && pnpm --filter @paseo-plugins/session-reference test && node --test scripts/session-reference-ui.test.mjs",
+    "check:reference-live": "node scripts/check-session-reference.mjs",
+    "verify:evo": "pnpm --filter @paseo-plugins/subscription-evo typecheck && pnpm --filter @paseo-plugins/subscription-evo test && node --test scripts/bundles.test.mjs scripts/dev-plugin.test.mjs",
+    "format:evo": "prettier --write 'plugins/subscription-evo/**/*.{ts,tsx,json}' 'scripts/{bundles,dev-plugin,check-upstream-compiler}*.mjs'",
+    "format": "prettier --write 'plugins/**/*.{ts,tsx,json}' 'scripts/*.mjs' package.json pnpm-workspace.yaml",
+    "format:check": "prettier --check 'plugins/**/*.{ts,tsx,json}' 'scripts/*.mjs' package.json pnpm-workspace.yaml",
+    "plugin:install": "node scripts/dev-plugin.mjs install",
+    "plugin:update": "node scripts/dev-plugin.mjs update",
+    "plugin:check-compiler": "node scripts/check-upstream-compiler.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "prettier": "3.6.2",
+    "react": "19.1.0",
+    "react-test-renderer": "19.1.0"
+  },
+  "license": "Apache-2.0",
+  "author": "BackRunner",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/backrunner/paseo-plugins.git"
+  },
+  "homepage": "https://github.com/backrunner/paseo-plugins#readme",
+  "bugs": {
+    "url": "https://github.com/backrunner/paseo-plugins/issues"
+  }
+}

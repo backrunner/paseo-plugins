@@ -1,0 +1,6 @@
+{
+  "id": "session-reference",
+  "name": "Session Reference",
+  "description": "Reference a previous conversation and retrieve its history as needed.",
+  "requirements": { "paseo": ">=0.15.4 <0.16.0" }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "@paseo-plugins/media-preview",
+  "private": true,
+  "version": "0.1.0",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "OVERVIEW.*.md",
+    "index.client.tsx",
+    "client/",
+    "shared/"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test shared/*.test.ts client/*.test.ts",
+    "test:browser": "node ../../scripts/media-preview-browser.mjs"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.15.4",
+    "@types/node": "^22.20.5",
+    "@types/react": "~19.2.0",
+    "playwright": "1.56.1",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-web": "0.21.2",
+    "tsx": "4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "license": "Apache-2.0",
+  "author": "BackRunner",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/backrunner/paseo-plugins.git",
+    "directory": "plugins/media-preview"
+  },
+  "homepage": "https://github.com/backrunner/paseo-plugins#readme",
+  "bugs": {
+    "url": "https://github.com/backrunner/paseo-plugins/issues"
+  }
+}
