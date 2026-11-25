@@ -6,9 +6,12 @@ import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AgentSnapshotPayload } from '@getpaseo/protocol/messages';
-import type { QuotaReport } from '../shared/policy';
+import { classifyError, type QuotaReport } from '../shared/policy';
+import type { Launch } from '../shared/model';
+import { LaunchNotStarted, type LaunchBridge } from './launches';
 
 export type Agent = AgentSnapshotPayload;
+export type DeliveryMode = 'idle' | 'at';
 export interface Bridge {
   snapshot(id: string): Promise<Agent>;
   usage(id: string): Promise<QuotaReport[]>;
@@ -21,6 +24,7 @@ export interface Bridge {
     messageId: string,
     expected: Agent,
     allowed: () => boolean,
+    mode?: DeliveryMode,
   ): Promise<void>;
   close(): Promise<void>;
 }
@@ -41,7 +45,18 @@ export const fingerprint = (a: Agent) =>
     a.archivedAt,
     providerKey(a),
   ]);
+export const canSend = (expected: Agent, current: Agent, mode: DeliveryMode) =>
+  !current.archivedAt &&
+  !current.internal &&
+  !current.providerUnavailable &&
+  !current.pendingPermissions.length &&
+  (mode === 'at'
+    ? providerKey(expected) === providerKey(current)
+    : idle(current) && fingerprint(expected) === fingerprint(current));
 export class PreconditionChanged extends Error {}
+
+const sdkVersion = '0.17.4';
+const supportedDaemonVersions = ['0.16.2', sdkVersion];
 
 export async function inspectLocal(homeInput: string) {
   const home = await realpath(
@@ -74,7 +89,7 @@ async function connect(
   const client = factory(endpoint, {
     clientId: `subscription-evo-${randomUUID()}`,
     clientType: 'cli',
-    appVersion: '0.15.4',
+    appVersion: sdkVersion,
     sessionPermissions: [...permissions],
     localCredential: () => {
       const lock = JSON.parse(readFileSync(join(home, 'paseo.pid'), 'utf8')) as { listen?: string };
@@ -89,7 +104,12 @@ async function connect(
   try {
     await client.connect();
     const info = client.getLastServerInfoMessage();
-    if (!info || info.version !== '0.15.4' || (expectedId && info.serverId !== expectedId))
+    if (
+      !info ||
+      !info.version ||
+      !supportedDaemonVersions.includes(info.version) ||
+      (expectedId && info.serverId !== expectedId)
+    )
       throw new Error('Daemon identity or version mismatch');
     if (
       !info.permissions ||
@@ -109,8 +129,9 @@ export async function inspectBinding(homeInput: string, factory: ClientFactory =
   await client.close();
   return { home: local.home, serverId };
 }
-export class LocalBridge implements Bridge {
+export class LocalBridge implements Bridge, LaunchBridge {
   private reader: DaemonClient | null = null;
+  private openingReader: Promise<DaemonClient> | null = null;
   private writers = new Set<DaemonClient>();
   private stopped = false;
   constructor(
@@ -121,6 +142,12 @@ export class LocalBridge implements Bridge {
   private async readClient() {
     if (this.stopped) throw new Error('Connection stopped');
     if (this.reader?.getConnectionState().status === 'connected') return this.reader;
+    this.openingReader ??= this.openReader().finally(() => {
+      this.openingReader = null;
+    });
+    return this.openingReader;
+  }
+  private async openReader() {
     await this.reader?.close().catch(() => {});
     const local = await inspectLocal(this.home);
     const { client } = await connect(
@@ -142,6 +169,92 @@ export class LocalBridge implements Bridge {
     if (!result || result.agent.id !== id) throw new Error('Agent unavailable');
     return result.agent;
   }
+  async launchWorkspace(id: string) {
+    const workspace = await (await this.readClient()).findWorkspace(id);
+    const directory = workspace?.workspaceDirectory;
+    if (
+      !workspace ||
+      !directory ||
+      workspace.archivingAt ||
+      workspace.background ||
+      workspace.internal
+    )
+      return null;
+    return { name: workspace.name, directory };
+  }
+  async createScheduledAgent(launch: Launch, allowed: () => boolean) {
+    if (launch.serverId !== this.serverId) throw new LaunchNotStarted('workspace');
+    const client = await this.launchWriter();
+    try {
+      let workspace;
+      try {
+        workspace = await client.findWorkspace(launch.workspaceId);
+      } catch {
+        throw new LaunchNotStarted('connection');
+      }
+      if (
+        !workspace ||
+        workspace.workspaceDirectory !== launch.directory ||
+        workspace.archivingAt ||
+        workspace.background ||
+        workspace.internal
+      )
+        throw new LaunchNotStarted('workspace');
+      if (this.stopped || !allowed()) throw new LaunchNotStarted('connection');
+      const { provider, model, mode, thinking, options } = launch.config;
+      // The SDK's provider/model shorthand requires an explicit model. The daemon
+      // accepts an omitted model and resolves the provider's default at launch.
+      const agent = await client.createAgent({
+        workspaceId: launch.workspaceId,
+        idempotencyKey: launch.id,
+        agentId: launch.agentId,
+        clientMessageId: launch.id,
+        initialPrompt: launch.text,
+        config: {
+          cwd: launch.directory,
+          provider,
+          model: model ?? undefined,
+          modeId: mode ?? undefined,
+          thinkingOptionId: thinking ?? undefined,
+          providerOptions: options,
+        },
+      });
+      if (agent.id !== launch.agentId) throw new Error('Unexpected scheduled agent identity');
+    } finally {
+      this.writers.delete(client);
+      await client.close().catch(() => {});
+    }
+  }
+  private async launchWriter() {
+    if (this.stopped) throw new LaunchNotStarted('connection');
+    try {
+      const local = await inspectLocal(this.home);
+      const { client } = await connect(
+        local.home,
+        local.endpoint,
+        this.serverId,
+        true,
+        this.factory,
+      );
+      if (this.stopped) {
+        await client.close();
+        throw new Error('Connection stopped');
+      }
+      this.writers.add(client);
+      return client;
+    } catch {
+      throw new LaunchNotStarted('connection');
+    }
+  }
+  async confirmScheduledAgent(launch: Launch) {
+    if (launch.serverId !== this.serverId) return false;
+    const client = await this.readClient();
+    const result = await client.fetchAgent({ agentId: launch.agentId, timeout: 5000 });
+    return (
+      result?.agent.workspaceId === launch.workspaceId &&
+      (await this.hasMessage(launch.agentId, launch.id))
+    );
+  }
   async usage(id: string): Promise<QuotaReport[]> {
     const { reports } = await (
       await this.readClient()
@@ -150,11 +263,23 @@ export class LocalBridge implements Bridge {
       id: entry.id,
       fetchedAt: Date.parse(entry.fetchedAt),
       available: entry.report.status === 'available',
+      problem:
+        entry.report.status === 'unavailable'
+          ? entry.report.problem.kind === 'expired' ||
+            (entry.report.problem.kind === 'rejected' &&
+              [401, 403].includes(entry.report.problem.status))
+            ? ('auth' as const)
+            : ('unavailable' as const)
+          : entry.report.status === 'error'
+            ? classifyError(entry.report.error) === 'auth'
+              ? ('auth' as const)
+              : ('unavailable' as const)
+            : undefined,
       windows:
         entry.report.status === 'available'
           ? entry.report.windows.map((w) => ({
               id: w.id,
-              remaining: w.remainingPct ?? (w.usedPct == null ? null : 100 - w.usedPct),
+              remaining: remainingCapacity(w),
             }))
           : [],
     }));
@@ -187,7 +312,14 @@ export class LocalBridge implements Bridge {
       (item.messageId === messageId || item.clientMessageId === messageId)
     );
   }
-  async send(id: string, text: string, messageId: string, expected: Agent, allowed: () => boolean) {
+  async send(
+    id: string,
+    text: string,
+    messageId: string,
+    expected: Agent,
+    allowed: () => boolean,
+    mode: DeliveryMode = 'idle',
+  ) {
     const local = await inspectLocal(this.home);
     const { client } = await connect(local.home, local.endpoint, this.serverId, true, this.factory);
     this.writers.add(client);
@@ -199,11 +331,11 @@ export class LocalBridge implements Bridge {
         !current ||
         expected.id !== id ||
         current.agent.id !== id ||
-        !idle(current.agent) ||
-        fingerprint(expected) !== fingerprint(current.agent)
+        !canSend(expected, current.agent, mode)
       )
         throw new PreconditionChanged('Delivery precondition changed');
-      // Paseo 0.15.4 has no atomic idle-only send. This last check reduces, not eliminates, races.
+      // Timed messages steer an active turn immediately. Idle-only delivery still has a race
+      // with other clients because Paseo offers no atomic idle-only send.
       await client.sendAgentMessage(id, text, { messageId, activeTurnBehavior: 'steer' });
     } finally {
       this.writers.delete(client);
@@ -212,6 +344,19 @@ export class LocalBridge implements Bridge {
   }
   async close() {
     this.stopped = true;
-    await Promise.allSettled([this.reader?.close(), ...[...this.writers].map((c) => c.close())]);
+    await Promise.allSettled([
+      this.openingReader,
+      this.reader?.close(),
+      ...[...this.writers].map((c) => c.close()),
+    ]);
   }
+}
+
+function remainingCapacity(window: { remainingPct?: number | null; usedPct?: number | null }) {
+  const { remainingPct, usedPct } = window;
+  for (const value of [remainingPct, usedPct])
+    if (value != null && (!Number.isFinite(value) || value < 0 || value > 100)) return null;
+  if (remainingPct != null && usedPct != null && Math.abs(remainingPct + usedPct - 100) > 0.01)
+    return null;
+  return remainingPct ?? (usedPct == null ? null : 100 - usedPct);
 }

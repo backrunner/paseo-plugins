@@ -4,6 +4,6 @@ Use the player's controls to play, pause, seek, adjust volume and, where availab
 
 The plugin recognizes MP4, M4V, WebM, MOV, OGV, MP3, WAV, M4A, AAC, OGG, OGA, Opus, FLAC, AIF and AIFF. Actual decoding depends on the client's browser and operating system. No transcoding or external tools are used.
 
-Requires Paseo 0.15.4; this version targets the 0.15.x API. Mobile apps display an availability message without downloading the file because the current plugin interface has no cross-platform inline media player.
+Requires Paseo 0.16.2 or later within 0.16.x, or 0.17.4 or later within 0.17.x. On mobile, the panel displays an availability message without downloading the file.
 
 Files are read through Paseo's selected-host file handle, including remote-host files. Previews load the complete file and are limited to 1 GiB. File changes reload the preview and reset playback; deletion stops it. Closing the panel or hiding the app stops or pauses playback. The plugin has no server entry, opens no network listener, and sends no files to an external service.

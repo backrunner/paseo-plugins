@@ -36,7 +36,7 @@ test('real host attachment adapter applies current locale and compact presentati
   });
   const invoke = async (name, input) => {
     assert.equal(name, 'sessions.search');
-    assert.equal(input.locale, locale);
+    assert.deepEqual(input, { query: 'login' });
     return {
       items: [
         {
@@ -69,6 +69,14 @@ test('real host attachment adapter applies current locale and compact presentati
       assert.equal(
         i18n.resolve(contribution.searchPlaceholder, language),
         language === 'zh-CN' ? '搜索会话' : 'Search conversations',
+      );
+      await assert.rejects(
+        host.searchPluginAttachments(
+          contribution,
+          async () => ({ items: [], error: 'history-unavailable' }),
+          'login',
+        ),
+        language === 'zh-CN' ? /暂时无法读取会话/ : /Could not read conversations/,
       );
     }
   } finally {

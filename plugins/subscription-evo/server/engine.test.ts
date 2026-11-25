@@ -7,12 +7,22 @@ import { randomUUID } from 'node:crypto';
 import type { PluginHookPayload } from '@getpaseo/plugin/server';
 import { Engine } from './engine';
 import { Store } from './store';
-import { PreconditionChanged, fingerprint, idle, type Agent, type Bridge } from './bridge';
+import { PreconditionChanged, canSend, type DeliveryMode, type Agent, type Bridge } from './bridge';
 import { freshPolicy, State, type Policy, type Trigger } from '../shared/model';
 import type { QuotaReport } from '../shared/policy';
 
 /** No sockets, real provider, Paseo home, or child process is used by this fixture. */
 class SimulatedDaemon implements Bridge {
+  readonly serverId = 'simulated-daemon';
+  async launchWorkspace() {
+    return null;
+  }
+  async createScheduledAgent() {
+    throw new Error('No scheduled conversation in this fixture');
+  }
+  async confirmScheduledAgent() {
+    return false;
+  }
   agent: Agent = {
     id: 'agent-1',
     provider: 'codex',
@@ -72,10 +82,16 @@ class SimulatedDaemon implements Bridge {
   async latestIs(_agentId: string, id: string) {
     return this.latest === id;
   }
-  async send(_agentId: string, text: string, id: string, expected: Agent, allowed: () => boolean) {
+  async send(
+    _agentId: string,
+    text: string,
+    id: string,
+    expected: Agent,
+    allowed: () => boolean,
+    mode: DeliveryMode = 'idle',
+  ) {
     this.beforeSend?.();
-    if (!allowed() || !idle(this.agent) || fingerprint(expected) !== fingerprint(this.agent))
-      throw new PreconditionChanged();
+    if (!allowed() || !canSend(expected, this.agent, mode)) throw new PreconditionChanged();
     if (!this.sent.some((s) => s.id === id)) this.sent.push({ id, text });
     this.latest = id;
     this.agent.lastUserMessageAt = new Date(this.clock()).toISOString();
@@ -121,7 +137,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     });
   const ready = async () => {
     await engine.tick();
-    clock += 2500;
+    clock += 5000;
     await engine.tick();
   };
   const end = async (
@@ -159,18 +175,15 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     advance: (ms: number) => {
       clock += ms;
     },
-    restart: async () => {
+    restart: async (
+      random: () => number = () => {
+        throw new Error('Delay must not be sampled twice');
+      },
+    ) => {
       await engine.stop();
       const next = new Store(directory);
       await next.open();
-      engine = new Engine(
-        next,
-        daemon,
-        () => clock,
-        () => {
-          throw new Error('Delay must not be sampled twice');
-        },
-      );
+      engine = new Engine(next, daemon, () => clock, random);
       return next;
     },
   };
@@ -236,6 +249,215 @@ test('queue-only default, explicit one-message delivery and strict FIFO', async 
   assert.equal(f.store.state.jobs.find((j) => j.id === first.id)?.status, 'sent');
   await f.engine.tick();
   assert.equal(f.daemon.sent.length, 1, 'Never interrupt a running turn');
+});
+
+test('a timed message sends on the first due tick while a turn is active, exactly once', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    text: 'on time',
+    requestId: 'at',
+    trigger: { kind: 'at', at: f.now() + 60_000 },
+    allowDelivery: true,
+  });
+  f.daemon.agent.status = 'running';
+  f.daemon.agent.activeTurn = { turnId: 'running', startedAt: null };
+  f.advance(59_999);
+  await f.engine.tick();
+  assert.equal(f.daemon.sent.length, 0);
+  f.advance(1);
+  await f.engine.tick();
+  assert.deepEqual(
+    f.daemon.sent.map((s) => s.text),
+    ['on time'],
+  );
+  await f.engine.tick();
+  assert.equal(f.daemon.sent.length, 1);
+  assert.equal(f.store.state.policies[f.id].automatic, false);
+});
+
+test('ready timed messages bypass a paused, quota, idle or later deadline at the queue head', async (t) => {
+  for (const kind of ['paused', 'quota', 'idle', 'later'] as const) {
+    const f = await fixture(t);
+    const trigger: Trigger =
+      kind === 'quota'
+        ? { kind: 'quota', delay: { min: 2, max: 5 } }
+        : kind === 'later'
+          ? { kind: 'at', at: f.now() + 120_000 }
+          : { kind: 'idle' };
+    await f.engine.add({
+      agentId: f.id,
+      text: 'head',
+      requestId: 'head',
+      trigger,
+      allowDelivery: kind !== 'paused',
+    });
+    await f.engine.add({
+      agentId: f.id,
+      text: 'deadline',
+      requestId: 'at',
+      trigger: { kind: 'at', at: f.now() + 60_000 },
+      allowDelivery: true,
+    });
+    f.daemon.agent.status = 'running';
+    f.advance(60_000);
+    await f.engine.tick();
+    assert.deepEqual(
+      f.daemon.sent.map((s) => s.text),
+      ['deadline'],
+      kind,
+    );
+    assert.equal(f.store.state.jobs[0].status, 'queued', kind);
+  }
+});
+
+test('manual input, closing and cancellation preserve an explicitly authorized deadline', async (t) => {
+  for (const event of ['input', 'close', 'cancel'] as const) {
+    const f = await fixture(t);
+    await f.engine.add({
+      agentId: f.id,
+      text: 'deadline',
+      requestId: 'at',
+      trigger: { kind: 'at', at: f.now() + 60_000 },
+      allowDelivery: true,
+    });
+    if (event === 'input') f.daemon.agent.lastUserMessageAt = new Date(f.now() + 1).toISOString();
+    if (event === 'close') await f.engine.pauseAgent(f.id, 'session-closed');
+    if (event === 'cancel') await f.end('canceled');
+    f.advance(60_000);
+    await f.engine.tick();
+    assert.deepEqual(
+      f.daemon.sent.map((s) => s.text),
+      ['deadline'],
+      event,
+    );
+    assert.equal(f.store.state.policies[f.id].paused, true, 'Continuation remains paused');
+  }
+});
+
+test('timed delivery retains explicit holds, permission and provider checks', async (t) => {
+  for (const hold of [
+    'queue-only',
+    'edit',
+    'pause-all',
+    'permission',
+    'provider',
+    'unavailable',
+  ] as const) {
+    const f = await fixture(t);
+    const { id } = await f.engine.add({
+      agentId: f.id,
+      text: 'deadline',
+      requestId: 'at',
+      trigger: { kind: 'at', at: f.now() + 60_000 },
+      allowDelivery: hold !== 'queue-only',
+    });
+    if (hold === 'edit')
+      await f.engine.edit({ agentId: f.id, id, revision: 0, action: 'begin-edit' });
+    if (hold === 'pause-all') await f.engine.pauseAgent(f.id, 'user-paused');
+    if (hold === 'permission') {
+      await f.engine.pauseAgent(f.id, 'permission');
+      f.daemon.agent.pendingPermissions = [{ id: 'p' }] as Agent['pendingPermissions'];
+    }
+    if (hold === 'provider') f.daemon.agent.model = 'other';
+    if (hold === 'unavailable') f.daemon.agent.providerUnavailable = true;
+    f.advance(60_000);
+    await f.engine.tick();
+    assert.equal(f.daemon.sent.length, 0, hold);
+    if (hold === 'permission') {
+      f.daemon.agent.pendingPermissions = [];
+      await f.engine.tick();
+      assert.equal(f.daemon.sent.length, 1, 'Permission resolution releases the deadline');
+    }
+  }
+});
+
+test('saving continuation settings with automatic off does not revoke a scheduled message', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    text: 'deadline',
+    requestId: 'at',
+    trigger: { kind: 'at', at: f.now() + 60_000 },
+    allowDelivery: true,
+  });
+  await f.policy({ automatic: false });
+  f.advance(60_000);
+  await f.engine.tick();
+  assert.equal(f.daemon.sent.length, 1);
+});
+
+test('a due deadline survives reload and sends while the conversation is running', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    text: 'deadline',
+    requestId: 'at',
+    trigger: { kind: 'at', at: f.now() + 60_000 },
+    allowDelivery: true,
+  });
+  const next = await f.restart();
+  f.daemon.agent.status = 'running';
+  f.advance(60_000);
+  await f.engine.tick();
+  assert.equal(f.daemon.sent.length, 1);
+  assert.equal(next.state.jobs[0].status, 'sent');
+});
+
+test('an uncertain timed send blocks later deadlines without automatically resending', async (t) => {
+  const f = await fixture(t);
+  for (const text of ['first', 'second'])
+    await f.engine.add({
+      agentId: f.id,
+      text,
+      requestId: text,
+      trigger: { kind: 'at', at: f.now() + 60_000 },
+      allowDelivery: true,
+    });
+  f.daemon.sendError = true;
+  f.advance(60_000);
+  await f.engine.tick();
+  assert.equal(f.store.state.jobs[0].status, 'unknown');
+  await f.engine.tick();
+  await f.engine.tick();
+  assert.deepEqual(
+    f.daemon.sent.map((s) => s.text),
+    ['first'],
+  );
+  assert.equal(f.store.state.jobs[1].status, 'queued');
+});
+
+test('withdrawing during a due deadline check revokes delivery before dispatch', async (t) => {
+  const f = await fixture(t);
+  const { id } = await f.engine.add({
+    agentId: f.id,
+    text: 'deadline',
+    requestId: 'at',
+    trigger: { kind: 'at', at: f.now() + 60_000 },
+    allowDelivery: true,
+  });
+  f.advance(60_000);
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((r) => {
+    entered = r;
+  });
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  f.daemon.onSnapshot = async () => {
+    entered();
+    await gate;
+  };
+  const tick = f.engine.tick();
+  await reached;
+  const withdrawal = f.engine.edit({ agentId: f.id, id, revision: 0, action: 'withdraw' });
+  release();
+  await tick;
+  await withdrawal;
+  f.daemon.onSnapshot = null;
+  await f.engine.tick();
+  assert.equal(f.daemon.sent.length, 0);
+  assert.equal(f.store.state.jobs[0].status, 'canceled');
 });
 
 test('submission distinguishes rejection before a write from uncertain storage failures', async (t) => {
@@ -317,6 +539,164 @@ test('idempotent adds, conflicting requests and stale edits', async (t) => {
   assert.equal(f.store.state.jobs.length, 1);
 });
 
+test('authorized quota schedules survive input, closing, cancellation, permissions and settings changes', async (t) => {
+  for (const event of ['input', 'close', 'cancel', 'permission', 'settings'] as const) {
+    const f = await fixture(t);
+    await f.engine.add({
+      agentId: f.id,
+      text: 'after recovery',
+      requestId: 'quota',
+      trigger: { kind: 'quota', delay: { min: 1, max: 1 } },
+      allowDelivery: true,
+    });
+    f.daemon.quota(0);
+    await f.engine.tick();
+    if (event === 'input' || event === 'settings') {
+      f.daemon.agent.lastUserMessageAt = new Date(f.now() + 1).toISOString();
+      await f.engine.tick();
+    }
+    if (event === 'close') await f.engine.pauseAgent(f.id, 'session-closed');
+    if (event === 'cancel') await f.end('canceled');
+    if (event === 'permission') {
+      await f.engine.pauseAgent(f.id, 'permission');
+      f.daemon.agent.pendingPermissions = [{ id: 'p' }] as Agent['pendingPermissions'];
+    }
+    if (event === 'settings') await f.policy({ automatic: false });
+    f.advance(60_000);
+    f.daemon.quota(80);
+    await f.engine.tick();
+    assert.equal(f.store.state.jobs[0].dueAt, f.now() + 60_000, event);
+    assert.equal(f.store.state.jobs[0].manual, true, event);
+    assert.equal(f.daemon.sent.length, 0, event);
+    f.advance(60_000);
+    f.daemon.quota(80);
+    if (event === 'permission') {
+      await f.ready();
+      assert.equal(f.daemon.sent.length, 0, 'Pending permission still blocks sending');
+      f.daemon.agent.pendingPermissions = [];
+    }
+    f.daemon.agent.status = 'running';
+    await f.ready();
+    assert.equal(f.daemon.sent.length, 0, 'Quota schedules still wait for idle');
+    f.daemon.agent.status = 'idle';
+    await f.ready();
+    await f.ready();
+    assert.deepEqual(
+      f.daemon.sent.map((s) => s.text),
+      ['after recovery'],
+      event,
+    );
+    assert.equal(f.store.state.policies[f.id].paused, true, 'Continuation remains paused');
+    assert.equal(f.store.state.policies[f.id].automatic, false);
+  }
+});
+
+test('quota schedules respect explicit holds and show the cause of a session hold', async (t) => {
+  for (const hold of [
+    'queue-only',
+    'pause',
+    'edit',
+    'pause-all',
+    'withdraw',
+    'provider',
+    'auth',
+  ] as const) {
+    const f = await fixture(t);
+    const { id } = await f.engine.add({
+      agentId: f.id,
+      text: 'after recovery',
+      requestId: 'quota',
+      trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+      allowDelivery: hold !== 'queue-only',
+    });
+    if (hold === 'pause' || hold === 'edit' || hold === 'withdraw')
+      await f.engine.edit({
+        agentId: f.id,
+        id,
+        revision: 0,
+        action: hold === 'edit' ? 'begin-edit' : hold,
+      });
+    if (hold === 'pause-all') await f.engine.pauseAgent(f.id, 'user-paused');
+    if (hold === 'provider') f.daemon.agent.provider = 'claude';
+    if (hold === 'auth') await f.end('failed', '401 unauthorized');
+    f.daemon.quota(80);
+    await f.ready();
+    assert.equal(f.daemon.sent.length, 0, hold);
+    if (hold === 'auth') assert.equal(f.store.state.jobs[0].wait, 'error-auth');
+    if (hold === 'pause-all') assert.equal(f.store.state.jobs[0].wait, 'user-paused');
+  }
+});
+
+test('a quota failure preserves a user quota schedule with automatic quota resumption disabled', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'quota',
+    text: 'resume this',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  await f.end('failed', 'usage limit reached');
+  assert.equal(f.store.state.jobs[0].sawExhausted, true);
+  assert.equal(f.store.state.jobs[0].manual, true);
+  assert.equal(f.store.state.policies[f.id].paused, false);
+  f.daemon.quota(80);
+  await f.ready();
+  assert.deepEqual(
+    f.daemon.sent.map((s) => s.text),
+    ['resume this'],
+  );
+  assert.equal(f.store.state.jobs.length, 1);
+  assert.equal(f.store.state.policies[f.id].quotaResume, false);
+  assert.equal(f.store.state.policies[f.id].retryCount, 0);
+});
+
+test('a first positive quota observation starts the user delay and survives reload without resampling', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'quota',
+    text: 'already recovered',
+    trigger: { kind: 'quota', delay: { min: 2, max: 4 } },
+    allowDelivery: true,
+  });
+  f.daemon.quota(80);
+  await f.engine.tick();
+  const due = f.now() + 180_000;
+  assert.equal(f.store.state.jobs[0].dueAt, due);
+  const next = await f.restart();
+  f.advance(180_000);
+  f.daemon.quota(80);
+  await f.ready();
+  assert.equal(next.state.jobs[0].dueAt, due);
+  assert.equal(next.state.jobs[0].sampledDelayMs, 180_000);
+  assert.equal(f.daemon.sent.length, 1);
+});
+
+test('rebinding a provider cannot reuse positive quota cached for the previous provider', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'quota',
+    text: 'resume',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  f.daemon.quota(80);
+  await f.engine.tick();
+  f.daemon.agent.provider = 'claude';
+  await f.engine.tick();
+  await f.policy({ paused: false });
+  const job = f.store.state.jobs[0];
+  await f.engine.edit({ agentId: f.id, id: job.id, revision: job.revision, action: 'release' });
+  f.advance(5000);
+  f.daemon.quota(0, 'claude-account');
+  await f.ready();
+  assert.equal(f.daemon.usageCalls, 2);
+  assert.equal(f.daemon.sent.length, 0);
+  assert.equal(f.store.state.policies[f.id].notice, 'quota-account-changed');
+});
+
 test('quota requires fresh positive values in every window and persists random delay', async (t) => {
   const f = await fixture(t);
   await f.add({ kind: 'quota', delay: { min: 2, max: 4 } });
@@ -331,6 +711,7 @@ test('quota requires fresh positive values in every window and persists random d
   assert.equal(f.store.state.jobs[0].dueAt, null);
   f.advance(60_000);
   f.daemon.quota(50);
+  f.daemon.reports[0].windows.push({ id: 'daily', remaining: 50 });
   await f.engine.tick();
   const due = f.store.state.jobs[0].dueAt!;
   assert.equal(due, f.now() + 180_000);
@@ -338,6 +719,7 @@ test('quota requires fresh positive values in every window and persists random d
   assert.equal(nextStore.state.jobs[0].dueAt, due);
   f.advance(180_000);
   f.daemon.quota(50);
+  f.daemon.reports[0].windows.push({ id: 'daily', remaining: 50 });
   await f.ready();
   assert.equal(f.daemon.sent.length, 1);
   assert.equal(nextStore.state.jobs[0].sampledDelayMs, 180_000);
@@ -352,17 +734,224 @@ test('quota unknown, stale, and changed account never authorize delivery', async
   f.advance(60_000);
   f.daemon.quota(0);
   await f.engine.tick();
+  assert.equal(f.store.state.jobs[0].paused, true, 'Missing quota requires explicit review');
+  let job = f.store.state.jobs[0];
+  await f.engine.edit({ agentId: f.id, id: job.id, revision: job.revision, action: 'release' });
+  await f.engine.tick();
   f.advance(180_000);
   await f.ready();
   assert.equal(f.daemon.sent.length, 0);
+  assert.equal(f.store.state.jobs[0].paused, true, 'Stale quota also pauses the plan');
   f.advance(60_000);
   f.daemon.quota(80, 'other-account');
+  job = f.store.state.jobs[0];
+  await f.engine.edit({ agentId: f.id, id: job.id, revision: job.revision, action: 'release' });
   await f.ready();
   assert.equal(f.daemon.sent.length, 0);
   assert.equal(f.store.state.policies[f.id].paused, true);
 });
 
-test('failed usage reads are rate limited and do not become recovery', async (t) => {
+test('Fable and general weekly limits must recover independently of the five-hour limit', async (t) => {
+  const f = await fixture(t);
+  f.daemon.agent.provider = 'claude';
+  f.daemon.agent.model = 'claude-fable-5-2';
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'fable',
+    text: 'continue Fable',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  const quota = (five: number, week: number, fable: number) => {
+    f.daemon.quota(five);
+    f.daemon.reports[0].windows = [
+      { id: 'five_hour', remaining: five },
+      { id: 'weekly', remaining: week },
+      { id: 'weekly_model_fable', remaining: fable },
+    ];
+  };
+  for (const limits of [
+    [0, 70, 0],
+    [90, 70, 0],
+    [90, 0, 70],
+  ] as const) {
+    quota(limits[0], limits[1], limits[2]);
+    await f.ready();
+    assert.equal(f.store.state.jobs[0].dueAt, null);
+    assert.equal(f.daemon.sent.length, 0);
+    f.advance(60_000);
+  }
+  quota(90, 70, 70);
+  await f.ready();
+  assert.equal(f.daemon.sent.length, 1);
+});
+
+test('a plan with only a weekly limit recovers without inventing a five-hour limit', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'weekly',
+    text: 'weekly recovery',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  f.daemon.quota(0); // This fixture reports only a weekly window.
+  await f.ready();
+  f.advance(60_000);
+  f.daemon.quota(30);
+  await f.ready();
+  assert.equal(f.daemon.sent.length, 1);
+});
+
+test('missing Fable windows pause durably across reload and require an explicit fresh check', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'fable',
+    text: 'keep all windows',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  f.daemon.quota(50);
+  f.daemon.reports[0].windows.push({ id: 'weekly_model_fable', remaining: 0 });
+  await f.engine.tick();
+  const next = await f.restart(() => 0.5); // Recovery has not sampled its first delay yet.
+  assert.deepEqual(next.state.jobs[0].quotaWindowIds, ['weekly', 'weekly_model_fable']);
+  f.advance(60_000);
+  f.daemon.quota(50);
+  await f.ready();
+  assert.equal(next.state.jobs[0].wait, 'quota-windows-missing');
+  assert.equal(next.state.jobs[0].paused, true);
+  const calls = f.daemon.usageCalls;
+  f.advance(60_000);
+  f.daemon.reports[0].fetchedAt = f.now();
+  f.daemon.reports[0].windows.push({ id: 'weekly_model_fable', remaining: 50 });
+  await f.ready();
+  assert.equal(
+    f.daemon.usageCalls,
+    calls,
+    'A complete report cannot silently resume a paused plan',
+  );
+  const job = next.state.jobs[0];
+  await f.engine.edit({ agentId: f.id, id: job.id, revision: job.revision, action: 'release' });
+  await f.ready();
+  assert.equal(f.daemon.sent.length, 1);
+  assert.equal(next.state.policies[f.id].notice, '');
+});
+
+test('changing the quota delay cannot discard a previously observed Fable limit', async (t) => {
+  const f = await fixture(t);
+  await f.engine.add({
+    agentId: f.id,
+    requestId: 'fable',
+    text: 'keep quota binding',
+    trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+    allowDelivery: true,
+  });
+  f.daemon.quota(50);
+  f.daemon.reports[0].windows.push({ id: 'weekly_model_fable', remaining: 0 });
+  await f.engine.tick();
+  const job = f.store.state.jobs[0];
+  await f.engine.edit({
+    agentId: f.id,
+    id: job.id,
+    revision: job.revision,
+    action: 'edit',
+    trigger: { kind: 'quota', delay: { min: 1, max: 1 } },
+    allowDelivery: true,
+  });
+  f.advance(5000);
+  f.daemon.quota(50);
+  await f.ready();
+  assert.equal(f.store.state.jobs[0].wait, 'quota-windows-missing');
+  assert.equal(f.store.state.jobs[0].paused, true);
+  assert.equal(f.daemon.sent.length, 0);
+});
+
+test('authentication failures and unavailable quota pause instead of retrying or sending', async (t) => {
+  for (const problem of ['auth', 'unavailable'] as const) {
+    const f = await fixture(t);
+    await f.engine.add({
+      agentId: f.id,
+      requestId: 'quota',
+      text: 'review login',
+      trigger: { kind: 'quota', delay: { min: 0, max: 0 } },
+      allowDelivery: true,
+    });
+    f.daemon.reports = [
+      { id: 'account-1', fetchedAt: f.now(), available: false, problem, windows: [] },
+    ];
+    await f.ready();
+    const job = f.store.state.jobs[0];
+    assert.equal(job.status, 'queued');
+    assert.equal(job.paused, true);
+    assert.equal(job.manual, false);
+    assert.equal(job.wait, problem === 'auth' ? 'quota-auth' : 'quota-unknown');
+    f.advance(60_000);
+    f.daemon.quota(80);
+    await f.ready();
+    assert.equal(f.daemon.usageCalls, 1);
+    assert.equal(f.daemon.sent.length, 0);
+    await f.engine.edit({ agentId: f.id, id: job.id, revision: job.revision, action: 'release' });
+    await f.ready();
+    assert.equal(f.daemon.sent.length, 1, 'Explicit resumption forces a new report');
+  }
+});
+
+test('automatically generated quota continuation is paused intact when usage authentication fails', async (t) => {
+  const f = await fixture(t);
+  await f.policy({ automatic: true, quotaResume: true });
+  await f.end('failed', 'usage limit reached');
+  f.daemon.reports = [
+    { id: 'account-1', fetchedAt: f.now(), available: false, problem: 'auth', windows: [] },
+  ];
+  await f.ready();
+  assert.equal(f.store.state.jobs[0].source, 'quota');
+  assert.equal(f.store.state.jobs[0].status, 'queued', 'The continuation is held, not discarded');
+  assert.equal(f.store.state.jobs[0].paused, true);
+  f.advance(60_000);
+  f.daemon.quota(80);
+  await f.policy({ automatic: true });
+  await f.ready();
+  assert.equal(f.daemon.sent.length, 0, 'Saving global settings cannot release the quota hold');
+});
+
+test('quota is refreshed after the delay and new exhaustion or authentication failure cancels dispatch', async (t) => {
+  for (const blocked of ['weekly', 'auth'] as const) {
+    const f = await fixture(t);
+    await f.engine.add({
+      agentId: f.id,
+      requestId: 'quota',
+      text: 'check before dispatch',
+      trigger: { kind: 'quota', delay: { min: 1, max: 1 } },
+      allowDelivery: true,
+    });
+    f.daemon.quota(80);
+    await f.engine.tick();
+    f.advance(60_000);
+    f.daemon.quota(80);
+    await f.engine.tick(); // Positive quota, then the first idle observation.
+    const calls = f.daemon.usageCalls;
+    f.advance(5000);
+    if (blocked === 'weekly')
+      f.daemon.quota(0); // Another conversation consumed the quota.
+    else
+      f.daemon.reports = [
+        { id: 'account-1', fetchedAt: f.now(), available: false, problem: 'auth', windows: [] },
+      ];
+    await f.engine.tick();
+    assert.equal(f.daemon.usageCalls, calls + 1, 'Final check bypasses the minute cache');
+    assert.equal(f.daemon.sent.length, 0);
+    assert.equal(f.store.state.jobs[0].dueAt, null);
+    assert.equal(
+      f.store.state.jobs[0].wait,
+      blocked === 'weekly' ? 'quota-exhausted' : 'quota-auth',
+    );
+    assert.equal(f.store.state.jobs[0].paused, blocked === 'auth');
+  }
+});
+
+test('failed usage reads pause without background retries or becoming recovery', async (t) => {
   const f = await fixture(t);
   await f.add({ kind: 'quota', delay: { min: 0, max: 0 } });
   await f.policy({ automatic: true });
@@ -374,6 +963,8 @@ test('failed usage reads are rate limited and do not become recovery', async (t)
   await f.ready();
   assert.equal(f.daemon.usageCalls, 1);
   assert.equal(f.daemon.sent.length, 0);
+  assert.equal(f.store.state.jobs[0].paused, true);
+  assert.equal(f.store.state.jobs[0].wait, 'quota-check-failed');
 });
 
 test('a quota failure holds existing user messages without changing their text or adding duplicate continue', async (t) => {
@@ -758,6 +1349,7 @@ test('a clean reload preserves every queued task, its order, conditions, authori
   await f.ready();
   assert.equal(f.daemon.sent.length, 0, 'A reload does not accelerate scheduled work');
   f.advance(60_000);
+  f.daemon.quota(80, 'subscription-a');
   await f.ready();
   assert.equal(f.daemon.sent.length, 1);
   assert.equal(f.daemon.sent[0].text, 'scheduled');

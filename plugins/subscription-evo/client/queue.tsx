@@ -311,7 +311,7 @@ function QueueItem({ job, index, ...props }: QueueProps & { job: Job; index: num
   const [more, setMore] = useState(false),
     [full, setFull] = useState(false);
   const queued = job.status === 'queued';
-  const state = queued && job.paused ? 'paused' : job.wait;
+  const state = queued && job.paused && !job.wait.startsWith('quota-') ? 'paused' : job.wait;
   const status = !['time', 'queued'].includes(state)
     ? c(...(reasons[state] ?? [state, state]))
     : '';

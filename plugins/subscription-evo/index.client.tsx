@@ -2,6 +2,7 @@ import type { PluginClientContext } from '@getpaseo/plugin/client';
 import { QueuePanel, GoalPanel } from './client/panel';
 import { AutomationSettings } from './client/settings';
 import { registerEntries } from './client/entries';
+import { registerLaunches } from './client/launches';
 import { messages } from './client/messages';
 import {
   clearClientState,
@@ -95,7 +96,9 @@ export default function contribute(client: PluginClientContext) {
     },
   });
   const removeEntries = registerEntries(client);
+  const removeLaunches = registerLaunches(client);
   return () => {
+    removeLaunches();
     removeEntries();
     clearClientState();
   };

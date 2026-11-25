@@ -1,6 +1,15 @@
 import { defineRpc, defineSettings } from '@getpaseo/plugin';
 import { z } from 'zod';
-import { State, Trigger, Policy, Job } from './model';
+import {
+  State,
+  Trigger,
+  Policy,
+  Job,
+  Launch,
+  LaunchSummary,
+  LaunchInput,
+  LaunchDetails,
+} from './model';
 
 export const connection = defineSettings({
   id: 'connection',
@@ -33,6 +42,35 @@ export const counts = defineRpc({
   name: 'queue.counts',
   input: z.object({}),
   output: z.record(z.string(), z.number().int().nonnegative()),
+});
+export const launchList = defineRpc({
+  name: 'launch.list',
+  input: z.object({}),
+  output: z.object({
+    launches: z.array(LaunchSummary),
+    connected: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+export const launchConnect = defineRpc({
+  name: 'launch.connect',
+  input: z.object({ home: z.string().max(4096) }),
+  output: inspectConnection.output,
+});
+export const launchSubmit = defineRpc({
+  name: 'launch.submit',
+  input: LaunchInput,
+  output: z.union([z.object({ id }), z.object({ rejected: z.string() })]),
+});
+export const launchEdit = defineRpc({
+  name: 'launch.edit',
+  input: z.object({
+    id,
+    revision: z.number().int().nonnegative(),
+    action: z.enum(['pause', 'begin-edit', 'resume', 'cancel', 'update', 'check']),
+    details: LaunchDetails.optional(),
+  }),
+  output: z.object({ launch: Launch }),
 });
 export const add = defineRpc({
   name: 'queue.add',

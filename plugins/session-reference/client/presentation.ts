@@ -3,7 +3,7 @@ import type { searchSessions } from '../shared/contracts';
 
 type Item = RpcOutput<typeof searchSessions>['items'][number];
 
-// Paseo 0.15.4 places the title and subtitle on one line, with a non-shrinking
+// Paseo places the title and subtitle on one line, with a non-shrinking
 // title. Bound its visual width so long CJK titles leave room in a narrow picker.
 export function compactTitle(value: string, budget = 26): string {
   const clean = value

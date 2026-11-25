@@ -62,7 +62,7 @@ class Boundary extends Component<{ children: ReactNode; color: string }, { faile
     );
   }
 }
-function Button({
+export function Button({
   theme,
   compact,
   busy,
@@ -507,7 +507,9 @@ function Panel({
           {policy.notice ? <Text style={hint}>{reason(policy.notice)}</Text> : null}
           {policy.paused ? (
             <View style={row}>
-              <Text style={hint}>{c('本会话已暂停发送', 'Delivery paused for this session')}</Text>
+              <Text style={hint}>
+                {c('本会话自动续跑已暂停', 'Continuation paused for this session')}
+              </Text>
               <QueueAction
                 theme={theme}
                 compact={layout.compact}
@@ -685,10 +687,15 @@ function Panel({
                 </View>
               ) : null}
               <Text style={hint}>
-                {c(
-                  '仅发送这一条，忙时等待空闲',
-                  'Sends only this message, once the conversation is idle.',
-                )}
+                {mode === 'at'
+                  ? c(
+                      '到点直接发送这一条，运行中也会追加',
+                      'Sends this message at the chosen time, including during an active turn.',
+                    )
+                  : c(
+                      '仅发送这一条，忙时等待空闲',
+                      'Sends only this message, once the conversation is idle.',
+                    )}
               </Text>
               <View
                 style={{
@@ -795,7 +802,17 @@ function Panel({
                 jobs={jobs}
                 now={query.data?.now ?? Date.now()}
                 automatic={policy.automatic}
-                paused={policy.paused}
+                paused={
+                  policy.paused &&
+                  !jobs.some(
+                    (j) =>
+                      j.status === 'queued' &&
+                      j.source === 'user' &&
+                      j.trigger.kind !== 'idle' &&
+                      j.manual &&
+                      !j.paused,
+                  )
+                }
                 editingId={editing?.id}
                 editDisabled={Boolean(pendingRequest.current)}
                 goalObjective={g?.objective}

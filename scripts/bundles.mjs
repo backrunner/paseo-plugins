@@ -23,7 +23,7 @@ export async function bundle(target) {
     cache.set(
       target,
       (async () => {
-        // Mirrors 0.15.4's CJS evaluation and host modules. This is an offline simulation,
+        // Mirrors Paseo's CJS evaluation and host modules. This is an offline simulation,
         // not a substitute for the daemon's compiler or the native client renderer.
         const result = await build({
           entryPoints: [

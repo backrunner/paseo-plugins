@@ -10,6 +10,8 @@ export const messages = defineTranslations({
       later: 'Send later',
       pending: 'Queue · {{count}}',
       automation: 'Continuation settings',
+      launch: 'Schedule start',
+      launches: 'Scheduled conversations',
     },
     'zh-CN': {
       queue: 'Evo 队列',
@@ -19,6 +21,8 @@ export const messages = defineTranslations({
       later: '稍后发送',
       pending: '队列 · {{count}}',
       automation: '续跑设置',
+      launch: '定时开始',
+      launches: '定时新对话',
     },
   },
 });
@@ -35,10 +39,29 @@ export const reasons: Record<string, [string, string]> = {
   ],
   paused: ['已暂停', 'Paused'],
   busy: ['等待会话空闲', 'Waiting for idle'],
+  'provider-unavailable': [
+    '等待 provider 恢复可用',
+    'Waiting for the provider to become available',
+  ],
   permission: ['等待权限处理，自动发送已暂停', 'Permission pending; automation paused'],
   time: ['等待发送时间', 'Waiting for time'],
   'idle-check': ['确认会话空闲', 'Checking idle state'],
-  'quota-unknown': ['额度信息不足，继续等待', 'Quota unavailable; waiting'],
+  'quota-unknown': [
+    '额度信息缺失或无效，已暂停，请检查后恢复',
+    'Quota missing or invalid; paused for review',
+  ],
+  'quota-auth': [
+    '额度查询鉴权失败或登录过期，已暂停，请重新登录后恢复',
+    'Quota authentication failed or expired; sign in before resuming',
+  ],
+  'quota-check-failed': [
+    '额度查询失败，已暂停，请检查连接后恢复',
+    'Quota check failed; check the connection before resuming',
+  ],
+  'quota-windows-missing': [
+    '额度窗口不完整，已暂停，请检查后恢复',
+    'Quota windows incomplete; paused for review',
+  ],
   'quota-exhausted': ['等待额度恢复', 'Waiting for quota recovery'],
   'quota-poll-wait': ['等待额度查询', 'Waiting for a quota check'],
   'quota-awaiting-exhaustion': [
@@ -52,6 +75,10 @@ export const reasons: Record<string, [string, string]> = {
   'session-changed': [
     '会话有新输入或 provider 变化，请检查后恢复',
     'New input or provider change; review before resuming',
+  ],
+  'manual-input': [
+    '新输入已暂停自动续跑，已安排的消息仍按条件发送',
+    'New input paused continuation; scheduled messages remain authorized',
   ],
   'outcome-unknown': [
     '发送结果不明确，已停止重发，请检查会话',
@@ -80,7 +107,10 @@ export const reasons: Record<string, [string, string]> = {
     'Post-delivery state unavailable; review the conversation',
   ],
   archived: ['会话已归档', 'Session archived'],
-  'session-closed': ['会话已关闭', 'Session closed'],
+  'session-closed': [
+    '会话已关闭，已安排的消息仍按条件发送',
+    'Session closed; scheduled messages remain authorized',
+  ],
   sending: ['正在发送', 'Sending'],
   sent: ['已发送', 'Sent'],
   canceled: ['已取消', 'Canceled'],

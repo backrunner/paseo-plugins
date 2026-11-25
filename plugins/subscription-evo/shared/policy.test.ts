@@ -9,6 +9,7 @@ test('classification never treats bare 429, auth, context or tool errors as a tr
     assert.equal(classifyError(error), 'unknown');
   assert.equal(classifyError('Usage limit reached'), 'quota');
   assert.equal(classifyError('401 authentication failed'), 'auth');
+  assert.equal(classifyError('HTTP 403: quota exceeded, authentication failed'), 'auth');
   assert.equal(classifyError('context window exceeded'), 'context');
   assert.equal(classifyError('ECONNRESET'), 'transient');
   assert.equal(classifyError('HTTP 503 overloaded'), 'transient');
@@ -33,6 +34,59 @@ test('quota freshness and invalid data fail closed', () => {
     assert.equal(quotaState([{ ...report, fetchedAt }], 100_000).kind, 'unknown');
   assert.equal(quotaState([], 100_000).kind, 'unknown');
   assert.equal(quotaState([report, { ...report, id: 'another-account' }], 100_000).kind, 'unknown');
+});
+test('every reported window gates recovery, including Fable weekly and week-only plans', () => {
+  const base = { id: 'claude:account', fetchedAt: 100_000, available: true };
+  for (const blocked of ['five_hour', 'weekly', 'weekly_model_fable', 'monthly_custom']) {
+    const windows = ['five_hour', 'weekly', 'weekly_model_fable', 'monthly_custom'].map((id) => ({
+      id,
+      remaining: id === blocked ? 0 : 80,
+    }));
+    assert.equal(quotaState([{ ...base, windows }], 100_000).kind, 'exhausted', blocked);
+  }
+  assert.equal(
+    quotaState(
+      [
+        {
+          ...base,
+          windows: [
+            { id: 'weekly', remaining: 25 },
+            { id: 'weekly_model_fable', remaining: 10 },
+          ],
+        },
+      ],
+      100_000,
+    ).kind,
+    'available',
+    'No five-hour limit is required',
+  );
+  assert.equal(
+    quotaState([{ ...base, windows: [{ id: 'weekly', remaining: 0 }] }], 100_000).kind,
+    'exhausted',
+  );
+  assert.equal(
+    quotaState([{ ...base, windows: [{ id: 'weekly', remaining: 25 }] }], 100_000).kind,
+    'available',
+  );
+});
+test('a previously observed weekly window cannot disappear or be replaced by duplicates', () => {
+  const base = { id: 'claude:account', fetchedAt: 100_000, available: true };
+  const report = { ...base, windows: [{ id: 'five_hour', remaining: 80 }] };
+  const missing = quotaState([report], 100_000, ['five_hour', 'weekly_model_fable']);
+  assert.equal(missing.kind, 'unknown');
+  assert.equal(missing.reason, 'quota-windows-missing');
+  assert.equal(
+    quotaState([{ ...report, windows: [...report.windows, ...report.windows] }], 100_000).kind,
+    'unknown',
+  );
+  assert.equal(
+    quotaState([{ ...report, windows: [{ id: '', remaining: 80 }] }], 100_000).kind,
+    'unknown',
+  );
+  assert.equal(
+    quotaState([{ ...base, available: false, problem: 'auth', windows: [] }], 100_000).reason,
+    'quota-auth',
+  );
 });
 test('commands retain message separators, require timezones and validate delays', () => {
   assert.deepEqual(parseSend('idle -- hello -- world'), {

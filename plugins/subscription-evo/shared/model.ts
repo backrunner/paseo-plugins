@@ -57,20 +57,62 @@ export const Job = z.object({
   messageId: z.string(),
   frozenText: z.string().nullable(),
   quotaIds: z.array(z.string()),
+  quotaWindowIds: z.array(z.string()).default([]),
   sawExhausted: z.boolean(),
   sampledDelayMs: z.number().nullable(),
   quotaHold: z.boolean().default(false),
   quotaObservedAt: z.number().nullable().default(null),
 });
+export const LaunchConfig = z.object({
+  provider: z.string().min(1).max(200),
+  model: z.string().min(1).max(500).nullable(),
+  mode: z.string().min(1).max(200).nullable(),
+  thinking: z.string().min(1).max(200).nullable(),
+  options: z.record(z.string(), z.json()),
+});
+export const LaunchDetails = z.object({
+  text: z.string().trim().min(1).max(16000),
+  at: z.number().int().nonnegative().max(8_640_000_000_000_000),
+});
+export const LaunchInput = LaunchDetails.extend({
+  requestId: z.string().min(1).max(200),
+  workspaceId: z.string().min(1).max(500),
+  directory: z.string().min(1).max(4096),
+  config: LaunchConfig,
+});
+export const Launch = LaunchInput.extend({
+  id: z.uuid(),
+  agentId: z.uuid(),
+  serverId: z.string(),
+  workspaceName: z.string(),
+  revision: z.number().int().nonnegative(),
+  status: z.enum(['scheduled', 'paused', 'starting', 'started', 'unknown', 'canceled']),
+  problem: z.enum(['workspace', 'connection', 'unconfirmed']).nullable(),
+  receipt: z.string(),
+});
+export const LaunchSummary = Launch.pick({
+  id: true,
+  requestId: true,
+  serverId: true,
+  agentId: true,
+  workspaceName: true,
+  at: true,
+  revision: true,
+  status: true,
+  problem: true,
+}).extend({ preview: z.string() });
 export const State = z.object({
   version: z.literal(1),
   revision: z.number().int().nonnegative(),
   jobs: z.array(Job).max(500),
+  launches: z.array(Launch).max(500).default([]),
   policies: z.record(z.string(), Policy),
   events: z.array(z.string()).max(300),
 });
 export type State = z.infer<typeof State>;
 export type Job = z.infer<typeof Job>;
+export type Launch = z.infer<typeof Launch>;
+export type LaunchSummary = z.infer<typeof LaunchSummary>;
 export type Policy = z.infer<typeof Policy>;
 export type Trigger = z.infer<typeof Trigger>;
 export type Goal = z.infer<typeof Goal>;
@@ -78,11 +120,14 @@ export const freshState = (): State => ({
   version: 1,
   revision: 0,
   jobs: [],
+  launches: [],
   policies: {},
   events: [],
 });
 export const freshPolicy = (): Policy => Policy.parse({});
 export const queued = (job: Job) => job.status === 'queued';
+export const timedMessage = (job: Job) => job.source === 'user' && job.trigger.kind === 'at';
+export const scheduledMessage = (job: Job) => job.source === 'user' && job.trigger.kind !== 'idle';
 
 export const GoalReport = z.object({
   nonce: z.string(),

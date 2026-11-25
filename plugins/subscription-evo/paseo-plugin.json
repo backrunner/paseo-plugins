@@ -3,6 +3,6 @@
   "name": "SubscriptionEvo",
   "description": "Queue messages and resume work after temporary errors or quota recovery.",
   "requirements": {
-    "paseo": "0.15.4"
+    "paseo": "0.16.2 || 0.17.4"
   }
 }

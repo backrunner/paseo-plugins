@@ -2,12 +2,7 @@ import type { PaseoApi, PaseoAgent } from '@getpaseo/client';
 import type { PluginAttachmentItem } from '@getpaseo/plugin';
 import { checkPage, digest, encodeReference } from './history';
 
-export async function searchCatalog(
-  paseo: PaseoApi,
-  query: string,
-  signal: AbortSignal,
-  locale = 'en',
-) {
+export async function searchCatalog(paseo: PaseoApi, query: string, signal: AbortSignal) {
   const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   const candidates: PaseoAgent[] = [];
   const visited = new Set<string>();
@@ -90,11 +85,6 @@ export async function searchCatalog(
       else if (result.value) items.push(result.value);
     }
   }
-  if (!items.length && failures)
-    throw new Error(
-      locale.startsWith('zh')
-        ? '暂时无法读取会话，请稍后重试'
-        : 'Could not read conversations. Try again shortly.',
-    );
+  if (!items.length && failures) return { items, error: 'history-unavailable' as const };
   return { items };
 }

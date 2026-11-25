@@ -1,10 +1,10 @@
 # Paseo plugins
 
-面向 **Paseo 0.15.4** 的社区插件 monorepo，与 Paseo 官方项目无隶属关系。
+面向 **Paseo 0.17.4** 的社区插件 monorepo，与 Paseo 官方项目无隶属关系。SubscriptionEvo 支持 Paseo 0.16.2 和 0.17.4。Session Reference 和 Media Preview 支持 0.16.2 起的 0.16.x 版本，以及 0.17.4 起的 0.17.x 版本。
 
 | 插件 | 版本 | 用途 | 说明 |
 | --- | --- | --- | --- |
-| SubscriptionEvo | 0.1.5 | 定时消息、额度恢复续跑与目标循环 | [使用与验证](docs/subscription-evo-implementation.md) |
+| SubscriptionEvo | 0.1.8 | 定时消息、额度恢复续跑与目标循环 | [使用与验证](docs/subscription-evo-implementation.md) |
 | Session Reference | 0.1.1 | 引用已有会话，按需读取和搜索历史 | [使用与安装](docs/session-reference.md) |
 | Media Preview | 0.1.0 | 在工作区文件标签页预览音频和视频 | [使用与安装](plugins/media-preview/README.md) |
 
@@ -12,7 +12,9 @@
 
 SubscriptionEvo 提供定时消息、额度恢复后延迟发送、临时错误续跑和跨 provider 的目标循环。输入区的“稍后发送”展开原生浮层；“队列 · N”只在有待处理消息时出现。浮层只负责消息和发送时间。续跑在插件设置中按会话配置，目标通过 `/evo-goal` 打开。
 
-SubscriptionEvo 的自动检查、安装和重载验证见实施记录；真实发送和新版宿主内界面仍待人工验收。
+在已有工作区新建对话时，可从输入框工具栏选择「定时开始」。选定目标工作区和本地时间后，确认页面上的首条消息与模型配置。到期由 daemon 创建对话，原草稿保留。用 Command Center 的「定时新对话」查看、暂停、编辑或撤回任务。
+
+SubscriptionEvo 的自动检查、安装和重载验证见实施记录。Paseo 0.17.4 桌面端已验证定时消息，0.16.2 和 0.17.4 均已用本地 ACP 测试 provider 验证默认模型的定时新对话。真实 provider 的额度耗尽和恢复仍待验证。
 
 ## 本地开发
 
@@ -45,7 +47,7 @@ pnpm plugin:install --home /absolute/path/to/paseo-home
 pnpm plugin:update --home /absolute/path/to/paseo-home
 ```
 
-目标 daemon 需要已经运行，且已由你开启插件总开关。命令会先运行 `verify:evo`，确认同名插件来自本仓库，再安装本地目录或只重载 `subscription-evo`。成功后检查插件状态是否为 `running`。不会启用插件总开关、启动或重启 daemon，也不会替换其他目录的同名插件。宿主按 manifest 限制兼容版本为 0.15.4。
+目标 daemon 需要已经运行，且已由你开启插件总开关。命令会先运行 `verify:evo`，确认同名插件来自本仓库，再安装本地目录或只重载 `subscription-evo`。成功后检查插件状态是否为 `running`。不会启用插件总开关、启动或重启 daemon，也不会替换其他目录的同名插件。SubscriptionEvo 连接时会检查 daemon 版本、主机标识及会话权限，支持的版本列在插件 manifest 中。
 
 开发版直接引用 `plugins/subscription-evo`，不需要 npm 发布。源码改动需要运行更新命令；单纯改文件不会自动重载。
 
@@ -62,7 +64,7 @@ pnpm plugin:update --home /absolute/path/to/paseo-home
 5. 待发送消息可直接“编辑”或“撤回”。编辑先暂停原消息，正文和发送条件可一起修改，保存后仍在原队列位置；选择“保存并暂停”或“保存并安排”。关闭或放弃编辑不会恢复发送。撤回后原文留在历史中，可复制；发送中和结果不明的消息不能撤回。
 6. 每条消息的“更多操作”提供查看全文、复制、暂停或允许按条件发送、上移。历史入口仅在有历史记录时显示。已创建任务持久化在主机端，正常重载保留队列顺序、发送条件和单条授权；在途结果不明时停下来等待检查，不重复发送。
 
-Paseo 0.15.4 只向插件开放输入框上方的按钮轨道，未开放输入框下方的工具栏插槽，也不能读取原生草稿或替换原生发送行为。因此当前入口仍位于上方，消息在浮层里填写；它不会把原生输入框中的内容自动取走。队列消息和随后普通输入均发送给原来的 `agentId`，不会创建新会话。
+SubscriptionEvo 的入口位于输入框上方，消息在浮层里填写。Evo 队列和普通输入均发送给原来的 `agentId`。
 
 原有面板保留为 Command Center 与 slash 命令的备用入口：
 
@@ -81,13 +83,13 @@ Paseo 0.15.4 只向插件开放输入框上方的按钮轨道，未开放输入�
 - 额度延迟从首次获得可信恢复报告开始计时；最小值与最大值相同就是固定延迟。随机延迟只抽样一次并持久化。
 - 普通输入视为手动接管，会暂停自动续跑。要继续托管新任务，可以从 Evo 队列提交，或在面板检查后恢复。
 
-**携带附件时不要使用 `/evo-*`。** Paseo 0.15.4 会跳过插件 slash handler，可能把命令原文发送给模型。请移除附件或使用“稍后发送”浮层；当前插件队列只支持浮层中的文本，不会带走原生输入框的附件。
+**携带附件时不要使用 `/evo-*`。** Paseo 会跳过插件 slash handler，可能把命令原文发送给模型。请移除附件或使用“稍后发送”浮层；当前插件队列只支持浮层中的文本，不会带走原生输入框的附件。
 
-Evo 是独立扩展队列。0.15.4 没有公开的原生队列控制接口，因此不能与原生 queued rows 合并，也不能保证两套队列的全局先后顺序。
+Evo 独立于 Paseo 原生队列，两套队列各自排序。
 
 ## 当前边界
 
-自动发送需要多次空闲检查，但 Paseo 0.15.4 缺少原子的“仅空闲时发送”接口，仍存在其他客户端恰好同时发送的竞争。默认仅排队适合仍在人工交互的会话。
+空闲发送会在投递前检查会话状态。其他客户端仍可能在最后一次检查后同时发送。默认仅排队适合仍在人工交互的会话。
 
 重试和目标循环不限制 provider 名称。额度恢复还要求宿主能为该会话返回唯一、足够新鲜的额度报告，且所有窗口均有剩余额度；未知或多账户不明确时等待。预计重置时间不作为恢复证明。不要在托管期间切换订阅登录。
 
@@ -95,10 +97,11 @@ Evo 是独立扩展队列。0.15.4 没有公开的原生队列控制接口，因
 
 详细实现、容量限制和人工验收步骤见 [实施与验证记录](docs/subscription-evo-implementation.md)。原始接口研究见 [可行性研究](docs/subscription-evo-research.md)。
 
-如已另行取得 Paseo v0.15.4 源码，可运行其编译器做离线兼容检查：
+可用 Paseo 官方源码中的编译器检查三个插件。脚本按源码的实际版本检查 manifest，也可用 `--plugin` 指定单个插件目录。
 
 ```sh
-pnpm plugin:check-compiler --source /absolute/path/to/paseo-v0.15.4
+pnpm plugin:check-compiler --source /absolute/path/to/paseo-v0.17.4
+pnpm plugin:check-compiler --source /absolute/path/to/paseo-v0.16.2
 ```
 
 此命令只读源码并编译插件，不启动或连接 Paseo。

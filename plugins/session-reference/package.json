@@ -17,9 +17,9 @@
     "test": "tsx --test server/*.test.ts client/*.test.ts"
   },
   "devDependencies": {
-    "@getpaseo/client": "0.15.4",
-    "@getpaseo/plugin": "0.15.4",
-    "@getpaseo/protocol": "0.15.4",
+    "@getpaseo/client": "0.17.4",
+    "@getpaseo/plugin": "0.17.4",
+    "@getpaseo/protocol": "0.17.4",
     "@types/node": "^22.20.5",
     "@types/react": "~19.2.0",
     "react": "19.1.0",

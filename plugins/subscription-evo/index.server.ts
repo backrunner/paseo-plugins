@@ -1,7 +1,7 @@
 import type { PluginServerContext, PluginSettingsState } from '@getpaseo/plugin/server';
 import { join } from 'node:path';
 import * as rpc from './shared/contracts';
-import { freshState } from './shared/model';
+import { freshState, LaunchSummary } from './shared/model';
 import { inspectBinding, LocalBridge } from './server/bridge';
 import { Store } from './server/store';
 import { Engine } from './server/engine';
@@ -17,6 +17,7 @@ export default function contribute(server: PluginServerContext) {
   const configure = (state: PluginSettingsState<typeof rpc.connection.schema>) => {
     const token = ++generation;
     engine?.fence();
+    engine?.launches.stop();
     configuration = configuration
       .catch(() => {})
       .then(async () => {
@@ -93,6 +94,27 @@ export default function contribute(server: PluginServerContext) {
     }
     return counts;
   });
+  server.handle(rpc.launchList, async () => {
+    await configuration;
+    return {
+      launches: (engine?.store.state.launches ?? []).map((launch) =>
+        LaunchSummary.parse({
+          ...launch,
+          preview: launch.text.length > 320 ? `${launch.text.slice(0, 320)}…` : launch.text,
+        }),
+      ),
+      connected: Boolean(engine && !engine.store.fault),
+      error: engine?.store.fault ?? error,
+    };
+  });
+  server.handle(rpc.launchConnect, async ({ home }, { paseo }) => {
+    const binding = await inspectBinding(home);
+    if (binding.serverId !== (await paseo.hosts.list()).self.serverId)
+      throw new Error('The directory belongs to a different host');
+    return binding;
+  });
+  server.handle(rpc.launchSubmit, async (input) => (await requireEngine()).launches.submit(input));
+  server.handle(rpc.launchEdit, async (input) => (await requireEngine()).launches.edit(input));
   server.handle(rpc.add, async (input) => (await requireEngine()).add(input));
   server.handle(rpc.submit, async (input) => (await requireEngine()).submit(input));
   server.handle(rpc.edit, async (input) => (await requireEngine()).edit(input));

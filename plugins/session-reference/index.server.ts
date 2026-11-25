@@ -33,13 +33,8 @@ export default function contribute(server: PluginServerContext) {
     input: searchInput,
     execute: (input, { paseo, signal }) => result(() => new History(paseo, signal).search(input)),
   });
-  server.handle(searchSessions, ({ query, locale }, { paseo }) =>
-    searchCatalog(
-      paseo,
-      query,
-      AbortSignal.any([lifetime.signal, AbortSignal.timeout(20000)]),
-      locale,
-    ),
+  server.handle(searchSessions, ({ query }, { paseo }) =>
+    searchCatalog(paseo, query, AbortSignal.any([lifetime.signal, AbortSignal.timeout(20000)])),
   );
   const remove = server.addHook('agent.open.before', async ({ request }) => {
     if (request.purpose === 'history') return;

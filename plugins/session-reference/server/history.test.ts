@@ -333,12 +333,12 @@ test('native attachment contains a short reference and no transcript', async () 
 });
 test('empty history is omitted and unreadable history is reported', async () => {
   const f = fixture(0);
-  assert.equal((await searchCatalog(f.paseo, '', f.controller.signal)).items.length, 0);
+  assert.deepEqual(await searchCatalog(f.paseo, '', f.controller.signal), { items: [] });
   f.state.error = 'unavailable';
-  await assert.rejects(
-    searchCatalog(f.paseo, '', f.controller.signal),
-    /Could not read conversations/,
-  );
+  assert.deepEqual(await searchCatalog(f.paseo, '', f.controller.signal), {
+    items: [],
+    error: 'history-unavailable',
+  });
 });
 
 test('merged projected replies page by start sequence and remain individually readable', async () => {

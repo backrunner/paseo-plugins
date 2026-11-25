@@ -23,6 +23,9 @@ const source = resolve(root, 'plugins/session-reference');
 const require = createRequire(resolve(source, 'package.json'));
 const { createHostClient } = require('@getpaseo/client/node');
 const { createPaseoApi } = require('@getpaseo/client');
+const { assertPluginCompatibility } = require('@getpaseo/protocol/plugin-requirements');
+const manifest = require(resolve(source, 'paseo-plugin.json'));
+const appVersion = require(resolve(source, 'package.json')).devDependencies['@getpaseo/client'];
 const pid = JSON.parse(readFileSync(resolve(home, 'paseo.pid'), 'utf8'));
 assert.match(pid.listen, /^(127\.0\.0\.1|\[::1\]):\d+$/);
 const credentialPath = resolve(home, 'local-credential');
@@ -35,8 +38,8 @@ if (process.platform !== 'win32') {
 const client = createHostClient(pid.listen, {
   clientId: 'session-reference-integration-check',
   clientType: 'cli',
-  appVersion: '0.15.4',
-  // Paseo 0.15.4 classifies all plugin RPC invocations as daemon.manage, even read-only ones.
+  appVersion,
+  // Paseo classifies all plugin RPC invocations as daemon.manage, even read-only ones.
   sessionPermissions: ['daemon.read', 'workspace.read', 'daemon.manage'],
   localCredential: () => {
     assert.equal(JSON.parse(readFileSync(resolve(home, 'paseo.pid'), 'utf8')).listen, pid.listen);
@@ -53,11 +56,12 @@ try {
   await client.connect();
   const info = client.getLastServerInfoMessage();
   assert.equal(info.serverId, pid.serverId);
-  assert.equal(info.version, '0.15.4');
+  assertPluginCompatibility({ ...manifest, version: info.version, runtime: 'daemon' });
   api = createPaseoApi(client);
   const catalog = await client.invokePluginRpc('session-reference', 'sessions.search', {
     query: args[3],
   });
+  assert.equal(catalog.error, undefined, 'The daemon could not read matching conversation history');
   assert.ok(catalog.items.length > 0, 'No readable source found');
   let selected;
   for (const item of catalog.items) {

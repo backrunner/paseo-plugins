@@ -59,6 +59,7 @@ async function clientFixture({
   connected = true,
   surface = 'schedule',
   locale = 'en',
+  composer,
 } = {}) {
   const translationSdk = pluginRequire('@getpaseo/plugin/client');
   const { PluginTranslationRuntime, PluginTranslationProvider } = pluginRequire(
@@ -81,8 +82,11 @@ async function clientFixture({
     countFailure = false;
   let openedPanels = 0;
   const panels = new Map(),
+    screens = new Map(),
+    composerItems = new Map(),
     settingsScreens = new Map(),
     openedSettings = [];
+  let openedScreen;
   let rejected = null;
   const slash = new Map(),
     pills = [],
@@ -90,7 +94,8 @@ async function clientFixture({
   let fail = false,
     request;
   const mutations = [],
-    copied = [];
+    copied = [],
+    launchRequests = [];
   const theme = {
     colors: {
       foreground: dark ? '#ededed' : '#111111',
@@ -106,6 +111,12 @@ async function clientFixture({
   };
   const state = { version: 1, revision: 0, jobs: [], policies: {}, events: [] };
   const rpc = async (contract, input) => {
+    if (contract.name === 'launch.list') return { launches: [], connected, error: null };
+    if (contract.name === 'launch.submit') {
+      launchRequests.push(input);
+      if (fail) throw new Error('Simulated disconnect');
+      return { id: 'launch-1' };
+    }
     if (contract.name === 'queue.counts') {
       if (countFailure) throw new Error('Host unavailable');
       const counts = {};
@@ -181,6 +192,19 @@ async function clientFixture({
     throw new Error(`Unexpected mock RPC: ${contract.name}`);
   };
   const paseo = {
+    workspaces: {
+      list: async () => ({
+        entries: [
+          {
+            id: 'workspace',
+            name: 'Development',
+            projectDisplayName: 'Fixture',
+            workspaceDirectory: '/fixture',
+          },
+        ],
+        pageInfo: { nextCursor: null },
+      }),
+    },
     agents: {
       ref: () => ({ address: { serverId: 'simulation' } }),
       list: async () => ({
@@ -198,6 +222,7 @@ async function clientFixture({
     defineTranslations: translationSdk.defineTranslations,
     useTranslation: translationSdk.useTranslation,
     useAgent: (_id, select) => select({ provider: 'codex' }),
+    useComposer: () => composer,
     usePaseo: () => paseo,
     useRpc: (contract) => React.useCallback((input) => rpc(contract, input), [contract]),
     useSettings: () => ({
@@ -223,11 +248,13 @@ async function clientFixture({
       'SettingsInput',
       'SettingsSelect',
       'Icon',
+      'Action',
     ].map((name) => [name, primitive(name)]),
   );
   ui.copyText = async (value) => {
     copied.push(value);
   };
+  ui.FlatList = ({ ListHeaderComponent }) => ListHeaderComponent;
   const contribute = await evaluate('client', (name) =>
     name === '@getpaseo/plugin/client'
       ? sdk
@@ -245,7 +272,18 @@ async function clientFixture({
       if (contribution.id === 'queue') panel = contribution.Component;
     },
     addSettingsScreen: (value) => settingsScreens.set(value.id, value.Component),
-    addCommandCenterItem: (value) => commands.push(value),
+    addScreen: (value) => {
+      screens.set(value.id, value.Component);
+      return () => screens.delete(value.id);
+    },
+    addComposerItem: (value) => {
+      composerItems.set(value.id, value.Component);
+      return () => composerItems.delete(value.id);
+    },
+    addCommandCenterItem: (value) => {
+      commands.push(value);
+      return () => {};
+    },
     addSlashCommand: (value) => slash.set(value.name, value),
     addComposerPill: (value) => {
       pills.push(value);
@@ -261,19 +299,26 @@ async function clientFixture({
     openPanel() {
       openedPanels++;
     },
+    openScreen: (value) => {
+      openedScreen = value;
+    },
   });
   await Promise.resolve();
   let renderer;
   let mountedTarget = surface;
   const tree = (target, agentId) => {
     const Component =
-      target === 'settings'
-        ? settingsScreens.get('automation')
-        : target === 'goal'
-          ? panels.get('goal')
-          : target === 'panel'
-            ? panel
-            : pills.find((p) => p.id === target).button.behavior.Content;
+      target === 'launch-composer'
+        ? composerItems.get('schedule-launch')
+        : target === 'launch-screen'
+          ? screens.get('launches')
+          : target === 'settings'
+            ? settingsScreens.get('automation')
+            : target === 'goal'
+              ? panels.get('goal')
+              : target === 'panel'
+                ? panel
+                : pills.find((p) => p.id === target).button.behavior.Content;
     return React.createElement(
       query.QueryClientProvider,
       { client: queryClient },
@@ -283,11 +328,11 @@ async function clientFixture({
         React.createElement(Component, {
           theme,
           layout: { compact, platform: 'web' },
-          host: { id: 'h' },
+          host: { id: target === 'launch-screen' ? agentId : 'h' },
           context: 'agent',
           workspaceId: 'w',
           agentId,
-          params: { agentId },
+          params: target === 'launch-screen' ? (openedScreen?.params ?? {}) : { agentId },
           close() {},
         }),
       ),
@@ -348,6 +393,8 @@ async function clientFixture({
     slash,
     pills,
     commands,
+    launchRequests,
+    openedScreen: () => openedScreen,
     setFail: (v) => {
       fail = v;
     },
@@ -379,6 +426,60 @@ async function clientFixture({
     },
   };
 }
+
+test('the native draft opens a same-host review and retries the same scheduled start', async () => {
+  const composer = {
+    context: 'draft',
+    prompt: 'Create a new conversation later',
+    attachments: [{ sourceId: 'fixture', item: { id: 'text-only-excludes-this' } }],
+    agent: {
+      provider: 'codex',
+      model: 'example',
+      mode: 'review',
+      thinking: 'high',
+      options: { fast: false },
+    },
+  };
+  const f = await clientFixture({
+    surface: 'launch-composer',
+    composer,
+    compact: true,
+    dark: true,
+  });
+  try {
+    await act(async () => f.renderer.root.findByType('Action').props.onPress());
+    const route = f.openedScreen();
+    assert.deepEqual(Object.keys(route.params).sort(), ['draft', 'hostId']);
+    assert.equal(f.launchRequests.length, 0);
+    await f.reopen('launch-screen', 'other-host');
+    assert.equal(f.renderer.root.findAllByType('SettingsSelect').length, 0);
+    await f.reopen('launch-screen', 'h');
+    const picker = f.renderer.root.findByType('SettingsSelect');
+    assert.equal(picker.props.value, '');
+    await act(async () => picker.props.onValueChange('workspace'));
+    f.setFail(true);
+    await f.press('Confirm schedule');
+    assert.equal(f.launchRequests.length, 1);
+    assert.equal(f.renderer.root.findByType('SettingsSelect').props.disabled, true);
+    f.setFail(false);
+    await f.press('Retry save');
+    assert.deepEqual(f.launchRequests[0], f.launchRequests[1]);
+    const submitted = f.launchRequests[1];
+    assert.equal(submitted.workspaceId, 'workspace');
+    assert.equal(submitted.directory, '/fixture');
+    assert.equal(submitted.text, composer.prompt);
+    assert.deepEqual(submitted.config, composer.agent);
+    assert.equal('attachments' in submitted, false);
+    assert.ok(submitted.at > Date.now());
+    assert.ok(
+      f.renderer.root
+        .findAllByType('Text')
+        .some((node) => node.props.children === 'Schedule saved'),
+    );
+  } finally {
+    await f.dispose();
+  }
+});
 
 test('client bundle uses native themed controls in wide/compact and light/dark simulations', async () => {
   assert.ok((await bundle('client')).length > 0);
@@ -905,6 +1006,61 @@ test('secondary queue actions stay reachable and preserve scheduling intent', as
         .some(
           (n) => n.props.children === f.state.jobs[0].text && n.props.numberOfLines === undefined,
         ),
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('scheduled delivery is explained and pause-all remains reachable when continuation is paused', async () => {
+  const f = await clientFixture();
+  try {
+    assert.ok(
+      f.renderer.root
+        .findAllByType('Text')
+        .some(
+          (n) =>
+            n.props.children ===
+            'Sends this message at the chosen time, including during an active turn.',
+        ),
+    );
+    await enterMessage(f, 'first');
+    await f.press('Schedule message');
+    await f.reopen();
+    await enterMessage(f, 'second');
+    await f.press('Schedule message');
+    f.state.policies.a = { automatic: false, paused: true, notice: 'manual-input' };
+    await f.refresh();
+    assert.ok(buttons(f).includes('Pause all delivery'));
+    assert.ok(
+      f.renderer.root
+        .findAllByType('Text')
+        .some((n) => n.props.children === 'Continuation paused for this session'),
+    );
+    for (const job of f.state.jobs) {
+      job.trigger = { kind: 'quota', delay: { min: 5, max: 10 } };
+      job.dueAt = null;
+      job.wait = 'quota-exhausted';
+    }
+    await f.refresh();
+    assert.ok(buttons(f).includes('Pause all delivery'), 'Quota schedules can still be paused');
+    assert.ok(
+      f.renderer.root
+        .findAllByType('Text')
+        .some((n) => n.props.children === 'Waiting for quota recovery'),
+    );
+    f.state.jobs[0].paused = true;
+    f.state.jobs[0].manual = false;
+    f.state.jobs[0].wait = 'quota-auth';
+    await f.refresh();
+    assert.ok(
+      f.renderer.root
+        .findAllByType('Text')
+        .some(
+          (n) =>
+            n.props.children === 'Quota authentication failed or expired; sign in before resuming',
+        ),
+      'A quota hold shows its actionable cause instead of only Paused',
     );
   } finally {
     await f.dispose();

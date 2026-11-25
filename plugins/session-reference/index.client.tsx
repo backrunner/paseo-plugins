@@ -14,13 +14,13 @@ export default function contribute(client: PluginClientContext) {
       icon: 'MessagesSquare',
       search: {
         ...searchSessions,
-        input: searchSessions.input.transform((input) => ({
-          ...input,
-          locale: client.i18n.locale,
-        })),
-        output: searchSessions.output.transform((payload) => ({
-          items: payload.items.map((item) => presentSession(item, client.i18n.locale)),
-        })),
+        output: searchSessions.output.transform(({ items, error }) => {
+          if (error === 'history-unavailable') {
+            throw new Error(client.i18n.t(messages, 'historyUnavailable'));
+          }
+          const locale = client.i18n.locale;
+          return { items: items.map((item) => presentSession(item, locale)) };
+        }),
       },
     }),
   );

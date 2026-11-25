@@ -5,6 +5,8 @@ import * as rpc from '../shared/contracts';
 import {
   freshPolicy,
   queued,
+  timedMessage,
+  scheduledMessage,
   goalPrompt,
   parseReport,
   type Job,
@@ -29,6 +31,7 @@ import {
 } from './bridge';
 import { Store } from './store';
 import { SubmissionRejected } from './rejection';
+import { LaunchQueue, type LaunchBridge } from './launches';
 
 type Add = z.output<typeof rpc.add.input>;
 type Edit = z.output<typeof rpc.edit.input>;
@@ -45,15 +48,18 @@ export class Engine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private stable = new Map<string, { value: string; at: number }>();
-  private usage = new Map<string, { at: number; reports: QuotaReport[] }>();
+  private usage = new Map<string, { key: string; at: number; reports: QuotaReport[] }>();
   private lastUsageAttempt = -Infinity;
+  readonly launches: LaunchQueue;
   error: string | null = null;
   constructor(
     readonly store: Store,
-    readonly bridge: Bridge,
+    readonly bridge: Bridge & LaunchBridge,
     readonly now = Date.now,
     readonly random = Math.random,
-  ) {}
+  ) {
+    this.launches = new LaunchQueue(store, bridge, now);
+  }
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     const task = this.tail.then(() => {
       if (this.stopped) throw new Error('Scheduler stopped');
@@ -65,9 +71,12 @@ export class Engine {
   start() {
     if (this.timer || this.stopped) return;
     this.timer = setInterval(() => {
+      void this.launches.tick()?.catch(() => {
+        this.error = 'Connection or storage unavailable. Delivery stopped.';
+      });
       if (this.ticking) return;
       this.ticking = true;
-      void this.tick()
+      void this.tickMessages()
         .catch(() => {
           this.error = 'Connection or storage unavailable. Delivery stopped.';
         })
@@ -84,13 +93,15 @@ export class Engine {
     this.stopped = true;
     this.fence();
     if (this.timer) clearInterval(this.timer);
+    const launching = this.launches.stop();
     await this.bridge.close();
-    await this.tail;
+    await Promise.allSettled([this.tail, launching]);
     await this.store.close();
   }
   snapshot(agentId: string): State {
     const state = structuredClone(this.store.state);
     state.jobs = state.jobs.filter((j) => j.agentId === agentId);
+    state.launches = [];
     state.policies = state.policies[agentId] ? { [agentId]: state.policies[agentId] } : {};
     state.events = [];
     return state;
@@ -132,6 +143,7 @@ export class Engine {
       messageId: randomUUID(),
       frozenText: null,
       quotaIds: [],
+      quotaWindowIds: [],
       sawExhausted: source === 'quota',
       sampledDelayMs: null,
       quotaHold: false,
@@ -224,10 +236,18 @@ export class Engine {
           j.manual = false;
           j.wait = 'paused';
         }
-        if (input.action === 'resume') j.paused = false;
+        if (input.action === 'resume') {
+          j.paused = false;
+          this.usage.delete(j.agentId);
+          if (j.wait.startsWith('quota-') && s.policies[j.agentId].notice === j.wait)
+            s.policies[j.agentId].notice = '';
+        }
         if (input.action === 'release') {
           j.manual = true;
           j.paused = false;
+          this.usage.delete(j.agentId);
+          if (j.wait.startsWith('quota-') && s.policies[j.agentId].notice === j.wait)
+            s.policies[j.agentId].notice = '';
         }
         if (input.action === 'up') {
           const index = s.jobs.indexOf(j);
@@ -246,6 +266,9 @@ export class Engine {
           j.frozenText = null;
           if (input.trigger && JSON.stringify(input.trigger) !== JSON.stringify(j.trigger)) {
             this.validateTrigger(input.trigger);
+            const keepQuota =
+              (j.trigger.kind === 'quota' || j.quotaHold) &&
+              (input.trigger.kind === 'quota' || j.quotaHold);
             j.trigger = input.trigger;
             j.expiresAt = Math.max(
               this.now() + 7 * DAY,
@@ -257,13 +280,17 @@ export class Engine {
                 : input.trigger.kind === 'idle'
                   ? this.now()
                   : null;
-            j.quotaIds = [];
+            if (!keepQuota) {
+              j.quotaIds = [];
+              j.quotaWindowIds = [];
+            }
             j.sawExhausted = j.quotaHold;
             j.sampledDelayMs = null;
             if (j.quotaHold) j.dueAt = null;
           }
           j.manual = input.allowDelivery === true;
           j.paused = input.allowDelivery !== true;
+          if (j.manual) this.usage.delete(j.agentId);
           j.wait = j.paused ? 'paused' : 'queued';
           if (input.requestId) j.lastEdit = { id: input.requestId, signature };
         }
@@ -290,14 +317,18 @@ export class Engine {
         if (s.revision !== input.revision)
           throw new Error('Settings changed. Refresh before saving.');
         const p = this.policy(s, agent);
+        const wasPaused = p.paused;
         if (p.observedUserAt !== agent.lastUserMessageAt) p.retryCount = 0;
         Object.assign(p, input.values, {
           observedUserAt: agent.lastUserMessageAt,
           providerKey: providerKey(agent),
           notice: '',
         });
-        if (p.paused || !p.automatic)
-          for (const j of s.jobs) if (j.agentId === agent.id && queued(j)) j.manual = false;
+        const pausing = p.paused && !wasPaused;
+        if (pausing || !p.automatic)
+          for (const j of s.jobs)
+            if (j.agentId === agent.id && queued(j) && (pausing || !scheduledMessage(j)))
+              j.manual = false;
         if (!p.retry) this.cancelAuto(s, agent.id, 'retry');
         if (!p.quotaResume) this.cancelAuto(s, agent.id, 'quota');
       });
@@ -367,7 +398,15 @@ export class Engine {
     p.notice = reason;
     if (p.goal?.status === 'active') p.goal.status = 'paused';
     this.cancelAuto(s, agentId);
-    for (const j of s.jobs) if (j.agentId === agentId && queued(j)) j.manual = false;
+    const keepScheduled = [
+      'manual-input',
+      'permission',
+      'session-closed',
+      'turn-canceled',
+    ].includes(reason);
+    for (const j of s.jobs)
+      if (j.agentId === agentId && queued(j) && !(keepScheduled && scheduledMessage(j)))
+        j.manual = false;
     this.stable.delete(agentId);
   }
   pauseAgent(agentId: string, reason: string) {
@@ -402,13 +441,15 @@ export class Engine {
   private async observe(agent: Agent) {
     const p = this.store.state.policies[agent.id];
     if (!p) return false;
-    if (
-      p.providerKey !== providerKey(agent) ||
-      p.observedUserAt !== agent.lastUserMessageAt ||
-      agent.archivedAt ||
-      agent.internal
-    ) {
+    if (p.providerKey !== providerKey(agent) || agent.archivedAt || agent.internal) {
       await this.store.change((s) => this.pause(s, agent.id, 'session-changed'));
+      return false;
+    }
+    if (p.observedUserAt !== agent.lastUserMessageAt) {
+      await this.store.change((s) => {
+        this.pause(s, agent.id, 'manual-input');
+        s.policies[agent.id].observedUserAt = agent.lastUserMessageAt;
+      });
       return false;
     }
     return true;
@@ -452,9 +493,14 @@ export class Engine {
           const kind = classifyError(message, code);
           const pending = s.jobs.filter((j) => j.agentId === id && queued(j));
           if (pending.length) {
-            if (kind === 'quota' && policy.quotaResume && policy.retryCount < policy.maxRetries) {
-              policy.retryCount++;
+            const recover = policy.quotaResume && policy.retryCount < policy.maxRetries;
+            if (
+              kind === 'quota' &&
+              (recover || pending.some((j) => j.source === 'user' && j.trigger.kind === 'quota'))
+            ) {
+              if (recover) policy.retryCount++;
               for (const j of pending) {
+                if (!recover && !(j.source === 'user' && j.trigger.kind === 'quota')) continue;
                 j.quotaHold = true;
                 j.sawExhausted = true;
                 j.quotaObservedAt = this.now();
@@ -544,36 +590,61 @@ export class Engine {
       }
     });
   }
-  private async quota(job: Job) {
+  private async pauseQuota(jobId: string, reason: string) {
+    await this.store.change((s) => {
+      const j = s.jobs.find((j) => j.id === jobId)!;
+      j.paused = true;
+      j.manual = false;
+      j.dueAt = null;
+      j.wait = reason;
+      j.revision++;
+      s.policies[j.agentId].notice = reason;
+    });
+    this.stable.delete(this.store.state.jobs.find((j) => j.id === jobId)!.agentId);
+  }
+  private async quota(job: Job, agent: Agent, force = false) {
+    const key = providerKey(agent);
     let cached = this.usage.get(job.agentId);
-    if (!cached || this.now() - cached.at >= 60_000) {
+    if (force || !cached || cached.key !== key || this.now() - cached.at >= 60_000) {
       if (this.now() - this.lastUsageAttempt < 5000) {
         await this.wait(job.id, 'quota-poll-wait');
         return false;
       }
       this.lastUsageAttempt = this.now();
       // Record the attempt before awaiting so failures never cause a rapid polling loop.
-      cached = { at: this.now(), reports: [] };
+      cached = { key, at: this.now(), reports: [] };
       this.usage.set(job.agentId, cached);
-      cached.reports = await this.bridge.usage(job.agentId);
+      try {
+        cached.reports = await this.bridge.usage(job.agentId);
+      } catch (error) {
+        await this.pauseQuota(
+          job.id,
+          error instanceof Error && classifyError(error.message) === 'auth'
+            ? 'quota-auth'
+            : 'quota-check-failed',
+        );
+        return false;
+      }
     }
     const result = quotaState(
       cached.reports.some((r) => r.fetchedAt < Math.max(job.createdAt, job.quotaObservedAt ?? 0))
         ? []
         : cached.reports,
       this.now(),
+      job.quotaWindowIds,
     );
+    if (result.kind === 'unknown') {
+      await this.pauseQuota(job.id, result.reason);
+      return false;
+    }
     await this.store.change((s) => {
       const j = s.jobs.find((j) => j.id === job.id)!;
-      if (result.kind === 'unknown') {
-        j.wait = 'quota-unknown';
-        return;
-      }
       if (j.quotaIds.length && JSON.stringify(j.quotaIds) !== JSON.stringify(result.ids)) {
         this.pause(s, j.agentId, 'quota-account-changed');
         return;
       }
       j.quotaIds = result.ids;
+      j.quotaWindowIds = result.windowIds;
       if (result.kind === 'exhausted') {
         j.sawExhausted = true;
         j.quotaObservedAt = Math.max(
@@ -584,7 +655,7 @@ export class Engine {
         j.wait = 'quota-exhausted';
         return;
       }
-      if (!j.sawExhausted) {
+      if (!j.sawExhausted && !(j.source === 'user' && j.trigger.kind === 'quota')) {
         j.wait = 'quota-awaiting-exhaustion';
         return;
       }
@@ -602,7 +673,10 @@ export class Engine {
     });
     return result.kind === 'available';
   }
-  tick() {
+  async tick() {
+    await Promise.all([this.launches.tick(), this.tickMessages()]);
+  }
+  private tickMessages() {
     return this.serial(async () => {
       if (this.store.fault) throw new Error(this.store.fault);
       const ids = [
@@ -643,7 +717,7 @@ export class Engine {
         });
       return;
     }
-    if (!(await this.observe(agent))) return;
+    const observed = await this.observe(agent);
     const goal = this.store.state.policies[id]?.goal;
     if (goal?.status === 'active' && goal.expiresAt <= this.now()) {
       await this.store.change((s) => {
@@ -651,9 +725,26 @@ export class Engine {
         this.cancelAuto(s, id);
       });
     }
-    let job = this.store.state.jobs.find((j) => j.agentId === id && queued(j));
-    if (!job) return;
     const p = this.store.state.policies[id];
+    if (!p || agent.archivedAt || agent.internal) return;
+    const first = this.store.state.jobs.find((j) => j.agentId === id && queued(j));
+    // Explicit deadlines must not wait behind idle, paused, quota or later-timed messages.
+    // Preserve queue order among ready deadlines; other work retains FIFO semantics.
+    let job =
+      this.store.state.jobs.find(
+        (j) =>
+          j.agentId === id &&
+          queued(j) &&
+          timedMessage(j) &&
+          !j.paused &&
+          !j.quotaHold &&
+          (j.manual || (p.automatic && !p.paused)) &&
+          j.dueAt !== null &&
+          j.dueAt <= this.now(),
+      ) ?? (observed || (first && scheduledMessage(first) && first.manual) ? first : undefined);
+    if (!job) return;
+    const timed = timedMessage(job);
+    const authorized = scheduledMessage(job) && job.manual;
     if (job.expiresAt <= this.now()) {
       await this.store.change((s) => {
         const j = s.jobs.find((j) => j.id === job!.id)!;
@@ -662,8 +753,11 @@ export class Engine {
       });
       return;
     }
-    if (p.paused || job.paused) {
-      await this.wait(job.id, 'paused');
+    if ((p.paused && !authorized) || job.paused) {
+      await this.wait(
+        job.id,
+        job.paused ? (job.wait.startsWith('quota-') ? job.wait : 'paused') : p.notice || 'paused',
+      );
       return;
     }
     if (job.goalId) {
@@ -682,9 +776,13 @@ export class Engine {
         return;
       }
     }
-    if ((job.trigger.kind === 'quota' || job.quotaHold) && !(await this.quota(job))) return;
+    if ((job.trigger.kind === 'quota' || job.quotaHold) && !(await this.quota(job, agent))) return;
     job = this.store.state.jobs.find((j) => j.id === job!.id)!;
-    if (this.store.state.policies[id].paused || job.dueAt === null || job.dueAt > this.now()) {
+    if (
+      (this.store.state.policies[id].paused && !(scheduledMessage(job) && job.manual)) ||
+      job.dueAt === null ||
+      job.dueAt > this.now()
+    ) {
       await this.wait(job.id, 'time');
       return;
     }
@@ -692,19 +790,42 @@ export class Engine {
       await this.wait(job.id, 'approval');
       return;
     }
-    if (!idle(agent)) {
+    if (agent.providerUnavailable || agent.pendingPermissions.length || (!timed && !idle(agent))) {
       this.stable.delete(id);
-      await this.wait(job.id, agent.pendingPermissions.length ? 'permission' : 'busy');
+      await this.wait(
+        job.id,
+        agent.pendingPermissions.length
+          ? 'permission'
+          : agent.providerUnavailable
+            ? 'provider-unavailable'
+            : 'busy',
+      );
       return;
     }
-    const value = fingerprint(agent);
-    const prior = this.stable.get(id);
-    if (!prior || prior.value !== value) {
-      this.stable.set(id, { value, at: this.now() });
-      await this.wait(job.id, 'idle-check');
-      return;
+    if (!timed) {
+      const value = fingerprint(agent);
+      const prior = this.stable.get(id);
+      if (!prior || prior.value !== value) {
+        this.stable.set(id, { value, at: this.now() });
+        await this.wait(job.id, 'idle-check');
+        return;
+      }
+      if (this.now() - prior.at < 2000) return;
     }
-    if (this.now() - prior.at < 2000 || this.epoch !== epoch || this.stopped) return;
+    // Re-check every quota window immediately before dispatch. A countdown or an older
+    // positive report cannot establish that all limits are still available now.
+    if (job.trigger.kind === 'quota' || job.quotaHold) {
+      if (!(await this.quota(job, agent, true))) return;
+      job = this.store.state.jobs.find((j) => j.id === job!.id)!;
+      if (
+        job.paused ||
+        (this.store.state.policies[id].paused && !(scheduledMessage(job) && job.manual)) ||
+        job.dueAt === null ||
+        job.dueAt > this.now()
+      )
+        return;
+    }
+    if (this.epoch !== epoch || this.stopped) return;
     const jobId = job.id;
     await this.store.change((s) => {
       const j = s.jobs.find((j) => j.id === jobId)!;
@@ -725,6 +846,7 @@ export class Engine {
         job.messageId,
         agent,
         () => !this.stopped && !this.store.fault && this.epoch === epoch,
+        timed ? 'at' : 'idle',
       );
       await this.store.change((s) => {
         const j = s.jobs.find((j) => j.id === jobId)!;
@@ -750,7 +872,7 @@ export class Engine {
         }
         if (error instanceof PreconditionChanged) {
           j.status = 'queued';
-          j.wait = 'idle-check';
+          j.wait = timed ? 'queued' : 'idle-check';
           if (j.goalId && s.policies[id].goal) s.policies[id].goal!.turns--;
         } else {
           j.status = 'unknown';

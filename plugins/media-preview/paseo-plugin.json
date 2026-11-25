@@ -2,5 +2,5 @@
   "id": "media-preview",
   "name": "Media Preview",
   "description": "Preview audio and video directly in workspace file tabs.",
-  "requirements": { "paseo": ">=0.15.4 <0.16.0" }
+  "requirements": { "paseo": ">=0.16.2 <0.17.0 || >=0.17.4 <0.18.0" }
 }

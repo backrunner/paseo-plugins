@@ -44,6 +44,12 @@ export class Store {
             job.status = 'unknown';
             job.wait = 'outcome-unknown';
           }
+        for (const launch of state.launches)
+          if (launch.status === 'starting') {
+            launch.status = 'unknown';
+            launch.problem = 'unconfirmed';
+            launch.revision++;
+          }
       });
     } catch (error) {
       await this.close();

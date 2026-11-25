@@ -3,8 +3,9 @@ import { z } from 'zod';
 
 export const searchSessions = defineRpc({
   name: 'sessions.search',
-  input: z.object({ query: z.string().max(300), locale: z.string().max(50).default('en') }),
+  input: z.object({ query: z.string().max(300) }),
   output: z.object({
+    error: z.literal('history-unavailable').optional(),
     items: z.array(
       PluginAttachmentItemSchema.extend({
         details: z
